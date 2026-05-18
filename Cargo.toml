@@ -1,0 +1,23 @@
+[package]
+name = "jardedupli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zip = "2.5.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5.35", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "2.0"
+glob = "0.3.2"
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+
+[profile.release]
+# 开启优化和静态链接 C 运行时库（对于 Linux 和 macOS）
+opt-level = 3  # 优化等级，3 是最高优化等级
+lto = true     # 开启链接时优化（LTO）
+codegen-units = 1  # 提高编译速度，同时保持 LTO 的效果（在某些情况下）
+panic = 'abort'  # 在 panic 时直接终止程序，而不是展开堆栈（在某些情况下有助于减小二进制大小）

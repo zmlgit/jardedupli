@@ -46,34 +46,86 @@ impl MavenCoordinates {
 
     pub fn read_from_path(path: &str) -> Result<Vec<MavenCoordinates>, anyhow::Error> {
         let mut coordinates = Vec::new();
-        for path in glob(path).unwrap() {
+        let glob_result = match glob(path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("Warning: Invalid glob pattern '{}': {}", path, e);
+                return Ok(coordinates);
+            }
+        };
+        for path in glob_result {
             match path {
                 Ok(path) => {
                     if path.is_dir() && path.exists() {
-                        // 列出目录下的所有文件
-                        let entries = std::fs::read_dir(path).unwrap();
+                        let entries = match std::fs::read_dir(&path) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to read directory {:?}: {}", path, e);
+                                continue;
+                            }
+                        };
                         for entry in entries {
-                            let entry = entry.unwrap();
-                            let path = entry.path();
-                            if path.is_file() {
-                                // 处理文件
-                                let file_name = path.file_name().unwrap().to_str().unwrap();
+                            let entry = match entry {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to read entry: {}", e);
+                                    continue;
+                                }
+                            };
+                            let entry_path = entry.path();
+                            if entry_path.is_file() {
+                                let file_name = match entry_path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                {
+                                    Some(name) => name,
+                                    None => {
+                                        eprintln!("Warning: Non-UTF8 file name: {:?}", entry_path);
+                                        continue;
+                                    }
+                                };
                                 if file_name.ends_with(".jar") {
                                     println!("Find Jar File: {:?}", file_name);
-                                    // 处理 jar 文件
-                                    let jars = MavenCoordinates::from_jar(&path.to_str().unwrap())
-                                        .unwrap();
-                                    for jar in jars {
-                                        coordinates.push(jar);
+                                    let path_str = match entry_path.to_str() {
+                                        Some(s) => s.to_string(),
+                                        None => {
+                                            eprintln!("Warning: Non-UTF8 path: {:?}", entry_path);
+                                            continue;
+                                        }
+                                    };
+                                    match MavenCoordinates::from_jar(&path_str) {
+                                        Ok(jars) => {
+                                            for jar in jars {
+                                                coordinates.push(jar);
+                                            }
+                                        }
+                                        Err(e) => eprintln!(
+                                            "Warning: Failed to parse JAR {:?}: {}",
+                                            path_str, e
+                                        ),
                                     }
                                 }
                             }
                         }
-                    } else if path.is_file() && path.to_str().unwrap().ends_with(".jar") {
-                        let path = path.to_str().unwrap();
-                        let jars = MavenCoordinates::from_jar(&path).unwrap();
-                        for jar in jars {
-                            coordinates.push(jar);
+                    } else if path.is_file() {
+                        let path_str = match path.to_str() {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("Warning: Non-UTF8 path: {:?}", path);
+                                continue;
+                            }
+                        };
+                        if path_str.ends_with(".jar") {
+                            match MavenCoordinates::from_jar(path_str) {
+                                Ok(jars) => {
+                                    for jar in jars {
+                                        coordinates.push(jar);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to parse JAR {:?}: {}", path_str, e)
+                                }
+                            }
                         }
                     } else {
                         eprintln!("Path is not a jar file or directory: {:?}", path);
@@ -86,6 +138,9 @@ impl MavenCoordinates {
     }
 
     pub fn from_jar(jar_path: &str) -> Result<Vec<MavenCoordinates>, anyhow::Error> {
+        let abs_jar_path = std::fs::canonicalize(jar_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| jar_path.to_string());
         let file = File::open(jar_path)?;
         let mut archive = ZipArchive::new(file)?;
         let mut coordinates = Vec::new();
@@ -99,22 +154,22 @@ impl MavenCoordinates {
                 use std::io::Read;
                 entry.read_to_string(&mut content)?;
                 if let Some(mut maven_coordinates) = parse_properties(&content) {
-                    maven_coordinates.jar_path = Some(jar_path.to_string());
+                    maven_coordinates.jar_path = Some(abs_jar_path.clone());
                     coordinates.push(maven_coordinates);
                 }
             }
         }
         if coordinates.is_empty() {
             // 根据文件名推测Maven坐标
-            let file_name = jar_path.split('/').last().unwrap_or(jar_path);
+            let file_name = abs_jar_path.split('/').last().unwrap_or(&abs_jar_path);
             if !file_name.ends_with(".jar") {
                 return Err(anyhow::anyhow!("Not a JAR file"));
             }
-            let file_name = file_name.trim_end_matches(".jar");
+            let file_name = file_name.strip_suffix(".jar").unwrap_or(file_name);
             let parts: Vec<&str> = file_name.split('-').collect();
             if parts.len() < 2 {
                 let mut jar = MavenCoordinates::new(None, file_name.to_string(), None, None, None);
-                jar.jar_path = Some(jar_path.to_string());
+                jar.jar_path = Some(abs_jar_path.clone());
                 coordinates.push(jar.clone());
                 return Ok(coordinates);
             }
@@ -129,21 +184,23 @@ impl MavenCoordinates {
                 }
             }
 
-            let version = if version_pos > 0 {
-                Some(file_name[version_pos + 1..file_name.len()].to_string())
+            let version_str = if version_pos > 0 {
+                &file_name[version_pos + 1..]
             } else {
-                None
+                ""
             };
             if version_pos == 0 {
                 let mut jar =
-                    MavenCoordinates::new(None, file_name.to_string(), version, None, None);
-                jar.jar_path = Some(jar_path.to_string());
+                    MavenCoordinates::new(None, file_name.to_string(), None, None, None);
+                jar.jar_path = Some(abs_jar_path.clone());
                 coordinates.push(jar.clone());
                 return Ok(coordinates);
             }
+
             let artifact_id = file_name[0..version_pos].to_string();
+            let version = Some(version_str.to_string());
             let mut jar = MavenCoordinates::new(None, artifact_id, version, None, None);
-            jar.jar_path = Some(jar_path.to_string());
+            jar.jar_path = Some(abs_jar_path.clone());
             coordinates.push(jar.clone());
             return Ok(coordinates.clone());
         } else {
@@ -176,12 +233,12 @@ fn parse_properties(content: &str) -> Option<MavenCoordinates> {
     let mut packaging = None;
     for line in content.lines() {
         if let Some((key, value)) = line.split_once('=') {
-            match key {
-                "groupId" => group_id = Some(value.to_string()),
-                "artifactId" => artifact_id = value.to_string(),
-                "version" => version = Some(value.to_string()),
-                "classifier" => classifier = Some(value.to_string()),
-                "packaging" => packaging = Some(value.to_string()),
+            match key.trim() {
+                "groupId" => group_id = Some(value.trim().to_string()),
+                "artifactId" => artifact_id = value.trim().to_string(),
+                "version" => version = Some(value.trim().to_string()),
+                "classifier" => classifier = Some(value.trim().to_string()),
+                "packaging" => packaging = Some(value.trim().to_string()),
                 _ => (),
             }
         }
@@ -213,23 +270,24 @@ impl std::str::FromStr for MavenCoordinates {
             return Err("Invalid Maven coordinates".to_string());
         }
 
-        let group_id = if parts.len() > 2 {
-            Some(parts[0].to_string())
+        let (group_id, artifact_id, version) = if parts.len() == 2 {
+            // Format: artifactId:version
+            (None, parts[0].to_string(), Some(parts[1].to_string()))
         } else {
-            None
+            // Format: groupId:artifactId:version[:classifier][:packaging]
+            (
+                Some(parts[0].to_string()),
+                parts[1].to_string(),
+                Some(parts[2].to_string()),
+            )
         };
-        let artifact_id = parts[1].to_string();
-        let version = if parts.len() > 3 {
-            Some(parts[2].to_string())
-        } else {
-            None
-        };
-        let classifier = if parts.len() > 4 {
+
+        let classifier = if parts.len() > 3 {
             Some(parts[3].to_string())
         } else {
             None
         };
-        let packaging = if parts.len() > 5 {
+        let packaging = if parts.len() > 4 {
             Some(parts[4].to_string())
         } else {
             None
@@ -251,16 +309,40 @@ pub fn get_paths(path: &str) -> Result<Vec<String>, anyhow::Error> {
         match entry {
             Ok(path) => {
                 if path.is_dir() {
-                    let entries = std::fs::read_dir(path)?;
+                    let entries = match std::fs::read_dir(&path) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("Warning: Failed to read directory {:?}: {}", path, e);
+                            continue;
+                        }
+                    };
                     for entry in entries {
-                        let entry = entry?;
-                        let path = entry.path();
-                        if path.is_file() {
-                            paths.push(path.to_str().unwrap().to_string());
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                eprintln!("Warning: Failed to read entry: {}", e);
+                                continue;
+                            }
+                        };
+                        let entry_path = entry.path();
+                        if entry_path.is_file() {
+                            match entry_path.to_str() {
+                                Some(s) => paths.push(s.to_string()),
+                                None => {
+                                    eprintln!("Warning: Non-UTF8 path: {:?}", entry_path);
+                                    continue;
+                                }
+                            }
                         }
                     }
                 } else if path.is_file() {
-                    paths.push(path.to_str().unwrap().to_string());
+                    match path.to_str() {
+                        Some(s) => paths.push(s.to_string()),
+                        None => {
+                            eprintln!("Warning: Non-UTF8 path: {:?}", path);
+                            continue;
+                        }
+                    }
                 }
             }
             Err(e) => eprintln!("Error: {:?}", e),

@@ -1,10 +1,8 @@
-use std::collections::HashSet;
 
 use clap::Parser;
 use std::io::Write;
 mod handler;
-mod maven_coordinate;
-#[derive(Parser,Debug)]
+mod maven_coordinate;#[derive(Parser,Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// 源lib文件路径
@@ -33,12 +31,16 @@ fn main() {
         std::process::exit(1);
     }
     let management = if let Some(management_file) = args.whitelist {
-        Some(
-            handler::read_management_file(management_file.as_str()).unwrap_or_else(|e| {
-                eprintln!("Error reading management file: {}", e);
-                std::process::exit(-1);
-            }),
-        )
+        if std::path::Path::new(&management_file).exists() {
+            Some(
+                handler::read_management_file(management_file.as_str()).unwrap_or_else(|e| {
+                    eprintln!("Error reading management file: {}", e);
+                    std::process::exit(-1);
+                }),
+            )
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -49,7 +51,9 @@ fn main() {
             std::process::exit(-1);
         });
     if !std::path::Path::new(&args.target).exists() {
-        let _ = std::fs::create_dir_all(std::path::Path::new(&args.target).parent().unwrap());
+        if let Some(parent) = std::path::Path::new(&args.target).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
     }
     let targets = maven_coordinate::MavenCoordinates::read_from_path(args.target.as_str())
         .unwrap_or_else(|e| {
@@ -80,34 +84,54 @@ fn main() {
         })
     };
 
-    let source = maven_coordinate::get_paths(args.source.as_str()).unwrap_or_else(|e| {
-        eprintln!("Error getting paths: {}", e);
-        std::process::exit(-1);
-    });
-    let copy_source = merge_result
-        .values()
-        .filter(|x| x.jar_path.is_some())
-        .map(|x| x.jar_path.clone().unwrap_or_default().clone())
-        .collect::<HashSet<_>>();
-    for path in source {
-        if copy_source.contains(&path) {
-            let target_path = if args.target.ends_with("/") {
-                args.target.clone() + path.split("/").last().unwrap_or_default()
+    let mut copied = 0u32;
+    let mut skipped = 0u32;
+    for (_key, coord) in &merge_result {
+        let artifact_name = format!(
+            "{}:{}",
+            coord.group_id.as_deref().unwrap_or("?"),
+            coord.artifact_id
+        );
+        if let Some(ref jar_path) = coord.jar_path {
+            if !jar_path.is_empty() && std::path::Path::new(jar_path).exists() {
+                let filename = std::path::Path::new(jar_path).file_name();
+                if let Some(fname) = filename {
+                    let target_path = std::path::Path::new(&args.target).join(fname);
+                    if let Some(parent) = target_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::path::Path::new(jar_path).canonicalize().ok()
+                        == target_path.canonicalize().ok()
+                    {
+                        println!("[SKIP] {} (already in target)", artifact_name);
+                        skipped += 1;
+                        continue;
+                    }
+                    match std::fs::copy(jar_path, &target_path) {
+                        Ok(_) => {
+                            println!("[COPY] {} -> {}", jar_path, target_path.display());
+                            copied += 1;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[ERROR] copying {} -> {}: {}",
+                                jar_path,
+                                target_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
             } else {
-                args.target.clone() + "/" + path.split("/").last().unwrap_or_default()
-            };
-            let target_path = path.replace(args.source.as_str(), &target_path);
-            if !std::path::Path::new(&target_path).exists() {
-                let _ =
-                    std::fs::create_dir_all(std::path::Path::new(&target_path).parent().unwrap());
+                println!("[SKIP] {} (jar not found: {})", artifact_name, jar_path);
+                skipped += 1;
             }
-            if let Err(e) = std::fs::copy(path, target_path) {
-                eprintln!("Error copying file: {}", e);
-            }
-        }else {
-            println!("{} not in copy_source", path);
+        } else {
+            println!("[SKIP] {} (no jar path)", artifact_name);
+            skipped += 1;
         }
     }
+    println!("Done: {} copied, {} skipped", copied, skipped);
     if let Some(result_path) = args.result {
         let mut result = std::fs::File::create(result_path).unwrap_or_else(|e| {
             eprintln!("Error creating result file: {}", e);

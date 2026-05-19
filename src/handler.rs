@@ -11,93 +11,80 @@ pub fn read_management_file(management_file: &str) -> Result<Vec<MavenCoordinate
     Ok(jars)
 }
 
+fn make_key(coord: &MavenCoordinates) -> String {
+    if let Some(group_id) = &coord.group_id {
+        format!("{}:{}", group_id, coord.artifact_id)
+    } else {
+        format!("{}", coord.artifact_id)
+    }
+}
+
 pub(crate) fn merge_jars(
     sources: Vec<MavenCoordinates>,
     targets: Vec<MavenCoordinates>,
     management: Option<Vec<MavenCoordinates>>,
 ) -> Result<HashMap<String, MavenCoordinates>, anyhow::Error> {
-    let mut source_map = std::collections::HashMap::new();
+    let mut all_candidates: HashMap<String, Vec<MavenCoordinates>> = HashMap::new();
     for source in sources {
-        let key = if let Some(group_id) = &source.group_id {
-            format!("{}:{}", group_id, source.artifact_id)
-        } else {
-            format!("{}", source.artifact_id)
-        };
-        source_map.insert(key, source.clone());
+        let key = make_key(&source);
+        all_candidates.entry(key).or_default().push(source);
+    }
+    for target in targets {
+        let key = make_key(&target);
+        all_candidates.entry(key).or_default().push(target);
     }
 
-    let mut target_map = std::collections::HashMap::new();
-    for target in targets {
-        let key = if let Some(group_id) = &target.group_id {
-            format!("{}:{}", group_id, target.artifact_id)
-        } else {
-            format!("{}", target.artifact_id)
-        };
-        target_map.insert(key, target.clone());
-    }
-    let mut whitelist_map = std::collections::HashMap::new();
+    let mut whitelist_map: HashMap<String, MavenCoordinates> = HashMap::new();
     if let Some(management) = management {
         for item in management {
-            let key = if let Some(group_id) = &item.group_id {
-                format!("{}:{}", group_id, item.artifact_id)
+            let key = make_key(&item);
+            if whitelist_map.contains_key(&key) {
+                eprintln!("Warning: duplicate whitelist key '{}', keeping first entry", key);
             } else {
-                format!("{}", item.artifact_id)
-            };
-            whitelist_map.insert(key, item.clone());
-        }
-    }
-
-    let mut merged = std::collections::HashMap::new();
-
-    for (key, source) in target_map.iter() {
-        merged.insert(key.clone(), source.clone());
-    }
-
-    for (key, source) in source_map.iter() {
-        let jar_path = if let Some(jar_path) = &source.jar_path {
-            Some(jar_path.clone())
-        } else if let Some(target) = merged.get(key) {
-            if let Some(target) = &target.jar_path {
-                Some(target.clone())
-            } else {
-                None
+                whitelist_map.insert(key, item);
             }
-        } else {
-            None
-        };
-        if let Some(jar_path) = jar_path {
-            let mut source_clone = source.clone();
-            source_clone.jar_path = Some(jar_path);
-            merged.insert(key.clone(), source_clone);
-        } else {
-            merged.insert(key.clone(), source.clone());
         }
     }
 
-    for (key, source) in whitelist_map.iter() {
-        let jar_path = if let Some(jar_path) = &source.jar_path {
-            Some(jar_path.clone())
-        } else if let Some(target) = merged.get(key) {
-            if source.version == target.version {
-                if let Some(target_jar_path) = &target.jar_path {
-                    Some(target_jar_path.clone())
+    let mut merged: HashMap<String, MavenCoordinates> = HashMap::new();
+
+    for (key, candidates) in &all_candidates {
+        let unique_versions: std::collections::HashSet<&str> = candidates
+            .iter()
+            .map(|c| c.version.as_deref().unwrap_or(""))
+            .collect();
+
+        let primary = if unique_versions.len() > 1 {
+            // 版本冲突：优先用白名单指定的版本
+            if let Some(ref wl) = whitelist_map.get(key) {
+                let matched = candidates.iter().find(|c| c.version == wl.version);
+                if let Some(m) = matched {
+                    m
                 } else {
-                    None
+                    eprintln!(
+                        "Warning: whitelist version '{}' not found for '{}', using default",
+                        wl.version.as_deref().unwrap_or("?"),
+                        key
+                    );
+                    candidates.first().unwrap()
                 }
             } else {
-                None
+                candidates.first().unwrap()
             }
         } else {
-            None
+            // 无冲突：直接用第一个
+            candidates.first().unwrap()
         };
-        if let Some(jar_path) = jar_path {
-            let mut source_clone = source.clone();
-            source_clone.jar_path = Some(jar_path);
-            merged.insert(key.clone(), source_clone);
+
+        let jar_path = if primary.jar_path.is_some() {
+            primary.jar_path.clone()
         } else {
-            merged.insert(key.clone(), source.clone());
-        }
-        
+            candidates.iter().find_map(|c| c.jar_path.clone())
+        };
+
+        let mut entry = primary.clone();
+        entry.jar_path = jar_path;
+        merged.insert(key.clone(), entry);
     }
 
     Ok(merged)
@@ -119,5 +106,164 @@ mod tests {
         assert!(result.is_ok());
         let jars: HashMap<String, MavenCoordinates> = result.unwrap();
         assert!(!jars.is_empty());
+    }
+
+    #[test]
+    fn test_merge_jars_source_wins() {
+        // Source and target have same key, source should win
+        let source = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"1.0.0\"}]";
+        let target = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"2.0.0\"}]";
+        let source: Vec<MavenCoordinates> = serde_json::from_str(source).unwrap();
+        let target: Vec<MavenCoordinates> = serde_json::from_str(target).unwrap();
+        let result = merge_jars(source, target, None).unwrap();
+        assert_eq!(
+            result.get("com.example:lib").unwrap().version,
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_jars_whitelist_overrides() {
+        // Whitelist resolves version conflict
+        let source = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"2.0.0\"}]";
+        let target = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"1.0.0\"}]";
+        let management =
+            "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"1.0.0\"}]";
+        let source: Vec<MavenCoordinates> = serde_json::from_str(source).unwrap();
+        let target: Vec<MavenCoordinates> = serde_json::from_str(target).unwrap();
+        let management: Vec<MavenCoordinates> = serde_json::from_str(management).unwrap();
+        let result = merge_jars(source, target, Some(management)).unwrap();
+        assert_eq!(
+            result.get("com.example:lib").unwrap().version,
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_jars_jar_path_inherited() {
+        // Source without jar_path should inherit from target
+        let source_coord = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        let mut target_coord = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("2.0.0".into()),
+            None,
+            None,
+        );
+        target_coord.jar_path = Some("/path/to/lib.jar".into());
+        let result = merge_jars(vec![source_coord], vec![target_coord], None).unwrap();
+        let merged = result.get("com.example:lib").unwrap();
+        assert_eq!(merged.version, Some("1.0.0".to_string()));
+        assert_eq!(merged.jar_path, Some("/path/to/lib.jar".to_string()));
+    }
+
+    #[test]
+    fn test_merge_jars_target_only() {
+        // Target entry not in source should be preserved
+        let source = "[]";
+        let target = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"1.0.0\"}]";
+        let source: Vec<MavenCoordinates> = serde_json::from_str(source).unwrap();
+        let target: Vec<MavenCoordinates> = serde_json::from_str(target).unwrap();
+        let result = merge_jars(source, target, None).unwrap();
+        assert!(result.contains_key("com.example:lib"));
+        assert_eq!(
+            result.get("com.example:lib").unwrap().version,
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_jars_whitelist_inherits_jar_path() {
+        // Whitelist resolves conflict, picks matching version's jar_path
+        let mut source_coord = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("2.0.0".into()),
+            None,
+            None,
+        );
+        source_coord.jar_path = Some("/path/to/lib-2.0.0.jar".into());
+        let mut target_coord = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        target_coord.jar_path = Some("/path/to/lib-1.0.0.jar".into());
+        let management_coord = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        let result = merge_jars(vec![source_coord], vec![target_coord], Some(vec![management_coord])).unwrap();
+        let merged = result.get("com.example:lib").unwrap();
+        // Whitelist version wins
+        assert_eq!(merged.version, Some("1.0.0".to_string()));
+        // jar_path from the v1.0.0 candidate
+        assert_eq!(merged.jar_path, Some("/path/to/lib-1.0.0.jar".to_string()));
+    }
+
+    #[test]
+    fn test_merge_jars_duplicate_source_warning() {
+        // Duplicate source keys: first entry used as primary
+        let source = "[{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"1.0.0\"},{\"groupId\":\"com.example\",\"artifactId\":\"lib\",\"version\":\"2.0.0\"}]";
+        let source: Vec<MavenCoordinates> = serde_json::from_str(source).unwrap();
+        let result = merge_jars(source, vec![], None).unwrap();
+        assert_eq!(
+            result.get("com.example:lib").unwrap().version,
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_whitelist_picks_correct_jar_from_duplicates() {
+        let mut v1 = MavenCoordinates::new(
+            Some("com.fasterxml.jackson.core".into()),
+            "jackson-databind".into(),
+            Some("2.12.2".into()),
+            None,
+            None,
+        );
+        v1.jar_path = Some("/libs/jackson-databind-2.12.2.jar".into());
+
+        let mut v2 = MavenCoordinates::new(
+            Some("com.fasterxml.jackson.core".into()),
+            "jackson-databind".into(),
+            Some("2.9.9.3".into()),
+            None,
+            None,
+        );
+        v2.jar_path = Some("/libs/jackson-databind-2.9.9.3.jar".into());
+
+        let whitelist_entry = MavenCoordinates::new(
+            Some("com.fasterxml.jackson.core".into()),
+            "jackson-databind".into(),
+            Some("2.9.9.3".into()),
+            None,
+            None,
+        );
+
+        let result = merge_jars(
+            vec![v1, v2],
+            vec![],
+            Some(vec![whitelist_entry]),
+        )
+        .unwrap();
+
+        let merged = result.get("com.fasterxml.jackson.core:jackson-databind").unwrap();
+        assert_eq!(merged.version, Some("2.9.9.3".to_string()));
+        assert_eq!(
+            merged.jar_path,
+            Some("/libs/jackson-databind-2.9.9.3.jar".to_string())
+        );
     }
 }

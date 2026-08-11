@@ -100,12 +100,15 @@ fn main() {
                     if let Some(parent) = target_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if std::path::Path::new(jar_path).canonicalize().ok()
-                        == target_path.canonicalize().ok()
-                    {
-                        println!("[SKIP] {} (already in target)", artifact_name);
-                        skipped += 1;
-                        continue;
+                    if let (Ok(src_canon), Ok(target_canon)) = (
+                        std::path::Path::new(jar_path).canonicalize(),
+                        target_path.canonicalize(),
+                    ) {
+                        if src_canon == target_canon {
+                            println!("[SKIP] {} (already in target)", artifact_name);
+                            skipped += 1;
+                            continue;
+                        }
                     }
                     match std::fs::copy(jar_path, &target_path) {
                         Ok(_) => {

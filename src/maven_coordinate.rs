@@ -159,6 +159,18 @@ impl MavenCoordinates {
                 }
             }
         }
+        if coordinates.len() > 1 {
+            // uber/shaded jar：多个pom.properties，只保留与jar文件名匹配的主坐标
+            let file_name = abs_jar_path.split('/').last().unwrap_or(&abs_jar_path);
+            let file_stem = file_name.strip_suffix(".jar").unwrap_or(file_name);
+            let expected_artifact_id = extract_artifact_id_from_filename(file_stem);
+            if let Some(ref aid) = expected_artifact_id {
+                if let Some(primary) = coordinates.iter().find(|c| c.artifact_id == *aid) {
+                    coordinates = vec![primary.clone()];
+                }
+            }
+        }
+
         if coordinates.is_empty() {
             // 根据文件名推测Maven坐标
             let file_name = abs_jar_path.split('/').last().unwrap_or(&abs_jar_path);
@@ -225,6 +237,16 @@ impl MavenCoordinates {
         result
     }
 }
+fn extract_artifact_id_from_filename(file_stem: &str) -> Option<String> {
+    let chars: Vec<char> = file_stem.chars().collect();
+    for i in 0..file_stem.len() {
+        if chars[i] == '-' && i < chars.len() - 1 && chars[i + 1].is_ascii_digit() {
+            return Some(file_stem[0..i].to_string());
+        }
+    }
+    None
+}
+
 fn parse_properties(content: &str) -> Option<MavenCoordinates> {
     let mut group_id = None;
     let mut artifact_id = String::new();
@@ -301,54 +323,6 @@ impl std::str::FromStr for MavenCoordinates {
             jar_path: None,
         })
     }
-}
-
-pub fn get_paths(path: &str) -> Result<Vec<String>, anyhow::Error> {
-    let mut paths = Vec::new();
-    for entry in glob(path)? {
-        match entry {
-            Ok(path) => {
-                if path.is_dir() {
-                    let entries = match std::fs::read_dir(&path) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            eprintln!("Warning: Failed to read directory {:?}: {}", path, e);
-                            continue;
-                        }
-                    };
-                    for entry in entries {
-                        let entry = match entry {
-                            Ok(e) => e,
-                            Err(e) => {
-                                eprintln!("Warning: Failed to read entry: {}", e);
-                                continue;
-                            }
-                        };
-                        let entry_path = entry.path();
-                        if entry_path.is_file() {
-                            match entry_path.to_str() {
-                                Some(s) => paths.push(s.to_string()),
-                                None => {
-                                    eprintln!("Warning: Non-UTF8 path: {:?}", entry_path);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                } else if path.is_file() {
-                    match path.to_str() {
-                        Some(s) => paths.push(s.to_string()),
-                        None => {
-                            eprintln!("Warning: Non-UTF8 path: {:?}", path);
-                            continue;
-                        }
-                    }
-                }
-            }
-            Err(e) => eprintln!("Error: {:?}", e),
-        }
-    }
-    Ok(paths)
 }
 
 #[cfg(test)]

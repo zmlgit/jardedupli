@@ -16,14 +16,18 @@ src/
 
 ### Whitelist 仲裁语义（CRITICAL）
 
-`merge_jars` 对每个 key（`groupId:artifactId` 或 `artifactId`）的处理：
+`merge_jars` 对每个 key（`groupId:artifactId` 或 `artifactId`）的处理，**whitelist 优先**：
 
-| source 状态 | target 状态 | 处理 |
+| whitelist 状态 | 候选版本状态 | 处理 |
 |---|---|---|
-| 同 key 多版本冲突 | — | whitelist 命中且版本在候选 → 用 whitelist 版本；否则按 strategy fallback |
-| 同 key 同版本 | — | 按 strategy 选 primary（source=新构建 / target=旧部署） |
-| 只在 source | — | 用 source |
-| 只在 target | — | 用 target（保留部署） |
+| 定义了 key | whitelist 版本在候选（source/target） | 只拷贝 whitelist 版本，其余版本丢弃 |
+| 定义了 key | whitelist 版本不在候选 | 跳过该 key（不拷贝，相当于屏蔽） |
+| 未定义 key | 同 key 多版本冲突 | 按 strategy 选 primary（source=新构建 / target=旧部署） |
+| 未定义 key | 同 key 同版本 | 按 strategy 选 primary |
+| 未定义 key | 只在 source | 用 source |
+| 未定义 key | 只在 target | 用 target（保留部署） |
+
+**whitelist 命中但版本不存在 = 屏蔽该包**（`[BLOCK]` 日志 + 跳过，不再 fallback 到 strategy）。
 
 **classifier 不参与 key**，**无 groupId 时 key 仅 artifactId**。
 
@@ -74,7 +78,7 @@ cargo build --release
 # 构建 musl 静态二进制（部署到 Alpine 等需要）
 cargo build --release --target x86_64-unknown-linux-musl
 
-# 测试（24 个用例）
+# 测试（28 个用例）
 cargo test --release
 
 # Jenkins 部署典型用法
@@ -100,6 +104,7 @@ jardedupli -s src/ -t target/ --strategy target
 | `[SKIP] <name> (no jar path)` | MavenCoordinates 无 jar_path 字段 |
 | `[ERROR] ...` | 失败，stderr |
 | `[WARN] ...` | 非致命警告（whitelist 不存在等），stderr |
+| `[BLOCK] <key> (excluded by whitelist version '<v>')` | whitelist 命中但版本不在候选 → 屏蔽（不部署），stdout |
 | `Done: N copied, M skipped, K errors` | 总结 |
 
 **exit code**：0 成功 / 1 业务错误（含 copy 失败、source 为空、lock 失败等）/ 2 clap 参数错误。

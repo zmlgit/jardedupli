@@ -17,8 +17,15 @@ fn make_key(coord: &MavenCoordinates) -> String {
 
 /// 合并 source 和 target 的 jar 坐标。
 ///
-/// 同 key 同版本：按 strategy 选 primary（source=新构建覆盖部署 / target=保留现有部署）。
-/// 同 key 多版本冲突：whitelist 命中且版本存在候选 → 用 whitelist 版本；否则按 strategy fallback。
+/// whitelist（仲裁表）命中某个 key 即生效，不依赖版本冲突：
+///   - 版本在候选里 → 仲裁，选用 whitelist 指定的版本
+///   - 版本不在候选里 → 屏蔽（该 key 不进结果，main 不会 copy，即不部署）
+///
+/// whitelist 未命中的 key：同 key 同版本按 strategy 选 primary（source=新构建覆盖部署 /
+/// target=保留现有部署）；同 key 多版本按 strategy 取其一。
+///
+/// 注意：屏蔽是软屏蔽——被屏蔽的包不会被打进 merged，故不会被 copy 到 target；
+/// 但 target 里若已存在旧文件，不会被删除（main 只 copy 不删）。
 pub(crate) fn merge_jars(
     sources: Vec<MavenCoordinates>,
     targets: Vec<MavenCoordinates>,
@@ -68,41 +75,32 @@ pub(crate) fn merge_jars(
             all.push(t);
         }
 
-        let unique_versions: std::collections::HashSet<&str> = all
-            .iter()
-            .map(|c| c.version.as_deref().unwrap_or(""))
-            .collect();
-
-        let primary_from_whitelist = if unique_versions.len() > 1 {
-            if let Some(wl) = whitelist_map.get(&key) {
-                match all.iter().find(|c| c.version == wl.version).copied() {
-                    Some(m) => Some(m),
-                    None => {
-                        eprintln!(
-                            "Warning: whitelist version '{}' not found for '{}', falling back to {}",
-                            wl.version.as_deref().unwrap_or("?"),
-                            key,
-                            if prefer_source { "source" } else { "target" }
-                        );
-                        None
-                    }
+        // whitelist 优先：命中即生效（不依赖版本冲突）。
+        //   版本在候选 → 仲裁选该版本
+        //   版本不在候选 → 屏蔽（该 key 不进 merged，不部署）
+        // 未命中 whitelist → fallback 到 strategy
+        let primary = match whitelist_map.get(&key) {
+            Some(wl) => match all.iter().find(|c| c.version == wl.version).copied() {
+                Some(matched) => Some(matched),
+                None => {
+                    println!(
+                        "[BLOCK] {} (excluded by whitelist version '{}')",
+                        key,
+                        wl.version.as_deref().unwrap_or("?")
+                    );
+                    continue;
                 }
-            } else {
-                None
+            },
+            None => {
+                let first_source = srcs.first();
+                let first_target = tgts.first();
+                if prefer_source {
+                    first_source.or(first_target)
+                } else {
+                    first_target.or(first_source)
+                }
             }
-        } else {
-            None
         };
-
-        let primary = primary_from_whitelist.or_else(|| {
-            let first_source = srcs.first();
-            let first_target = tgts.first();
-            if prefer_source {
-                first_source.or(first_target)
-            } else {
-                first_target.or(first_source)
-            }
-        });
 
         let Some(primary) = primary else { continue };
 
@@ -356,5 +354,119 @@ mod tests {
             merged.jar_path.as_deref(),
             Some("/deploy/lib/cms.fsmc.impl-0.0.1-SNAPSHOT.jar")
         );
+    }
+
+    // ===== 屏蔽语义测试（whitelist 版本不在候选 → 不部署）=====
+
+    #[test]
+    fn test_whitelist_excludes_when_version_not_in_candidates() {
+        // 冲突场景：whitelist 写一个不存在的版本 → 屏蔽（不再 fallback）
+        let mut src = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("2.0.0".into()),
+            None,
+            None,
+        );
+        src.jar_path = Some("/build/lib-2.0.0.jar".into());
+        let mut tgt = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        tgt.jar_path = Some("/deploy/lib-1.0.0.jar".into());
+        let wl = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("9.9.9-notexist".into()), // 故意写错版本 → 屏蔽
+            None,
+            None,
+        );
+        let result = merge_jars(vec![src], vec![tgt], Some(vec![wl]), Strategy::Source).unwrap();
+        assert!(
+            !result.contains_key("com.example:lib"),
+            "写错版本号应屏蔽该包"
+        );
+    }
+
+    #[test]
+    fn test_whitelist_excludes_single_version_no_conflict() {
+        // 单版本（无冲突）也能被屏蔽：屏蔽不依赖版本冲突
+        let mut src = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        src.jar_path = Some("/build/lib-1.0.0.jar".into());
+        let wl = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("9.9.9".into()), // 不在候选
+            None,
+            None,
+        );
+        let result = merge_jars(vec![src], vec![], Some(vec![wl]), Strategy::Source).unwrap();
+        assert!(!result.contains_key("com.example:lib"));
+    }
+
+    #[test]
+    fn test_whitelist_arbitrate_single_version_matched() {
+        // 单版本 + whitelist 版本正好匹配 → 正常仲裁，不误屏蔽
+        let mut src = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        src.jar_path = Some("/build/lib-1.0.0.jar".into());
+        let wl = MavenCoordinates::new(
+            Some("com.example".into()),
+            "lib".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        let result = merge_jars(vec![src], vec![], Some(vec![wl]), Strategy::Source).unwrap();
+        assert!(result.contains_key("com.example:lib"));
+        assert_eq!(
+            result.get("com.example:lib").unwrap().version,
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_whitelist_exclude_only_blocks_matched_key() {
+        // 多个包：只屏蔽 whitelist 写错版本的，其余正常
+        let mut a = MavenCoordinates::new(
+            Some("com.example".into()),
+            "a".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        a.jar_path = Some("/build/a-1.0.0.jar".into());
+        let mut b = MavenCoordinates::new(
+            Some("com.example".into()),
+            "b".into(),
+            Some("1.0.0".into()),
+            None,
+            None,
+        );
+        b.jar_path = Some("/build/b-1.0.0.jar".into());
+        let wl = MavenCoordinates::new(
+            Some("com.example".into()),
+            "a".into(),
+            Some("9.9.9".into()), // 只屏蔽 a
+            None,
+            None,
+        );
+        let result = merge_jars(vec![a, b], vec![], Some(vec![wl]), Strategy::Source).unwrap();
+        assert!(!result.contains_key("com.example:a"), "a 应被屏蔽");
+        assert!(result.contains_key("com.example:b"), "b 不受影响");
     }
 }
